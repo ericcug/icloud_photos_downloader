@@ -218,7 +218,7 @@ def handle_connection_error(func: F) -> F:
             return func(*args, **kwargs)
         except (ConnectionError, TimeoutError, Timeout, NewConnectionError) as error:
             raise PyiCloudConnectionErrorException(
-                "Cannot connect to Apple iCloud service"
+                f"Cannot connect to Apple iCloud service. Details: {error}"
             ) from error
 
     return wrapper  # type: ignore[return-value]
