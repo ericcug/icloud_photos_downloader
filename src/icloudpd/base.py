@@ -1023,11 +1023,6 @@ def core_single_run(
 
                     directory = os.path.normpath(user_config.directory)
 
-                    # Clean up .part files from previously crashed sessions
-                    download.cleanup_orphaned_part_files(
-                        logger, directory, user_config.dry_run
-                    )
-
                     if user_config.skip_photos or user_config.skip_videos:
                         photo_video_phrase = "photos" if user_config.skip_videos else "videos"
                     else:
@@ -1179,6 +1174,11 @@ def core_single_run(
                             logger.info(message)
                             status_exchange.get_progress().photos_last_message = message
                         status_exchange.get_progress().reset()
+
+                    # Clean up .part files from previously crashed sessions
+                    download.cleanup_orphaned_part_files(
+                        logger, directory, user_config.dry_run
+                    )
 
                     if user_config.auto_delete:
                         autodelete_photos(

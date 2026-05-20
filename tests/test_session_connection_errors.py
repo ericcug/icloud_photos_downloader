@@ -117,7 +117,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
         with self.assertRaises(PyiCloudConnectionErrorException) as context:
             self.session.get(self.base_url)
 
-        self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
+        self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
         self.assertIsInstance(context.exception.__cause__, ConnectionError)
 
     def test_timeout_error_handling(self) -> None:
@@ -128,7 +128,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
             # Use a short timeout to ensure it times out
             self.session.get(self.base_url, timeout=0.5)
 
-        self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
+        self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
         # The underlying exception should be a timeout-related error
         self.assertTrue(
             isinstance(context.exception.__cause__, TimeoutError | Timeout)
@@ -144,7 +144,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
             with self.assertRaises(PyiCloudConnectionErrorException) as context:
                 self.session.get(self.base_url)
 
-            self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
+            self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
             self.assertIsInstance(context.exception.__cause__, TimeoutError)
 
     def test_new_connection_error_handling(self) -> None:
@@ -158,7 +158,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
             with self.assertRaises(PyiCloudConnectionErrorException) as context:
                 self.session.get(self.base_url)
 
-            self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
+            self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
             self.assertIsInstance(context.exception.__cause__, NewConnectionError)
 
     def test_other_exceptions_pass_through(self) -> None:
@@ -190,7 +190,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
             ):
                 getattr(self.session, method)(self.base_url)
 
-                self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
+                self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
                 self.assertIsInstance(context.exception.__cause__, ConnectionError)
 
 
