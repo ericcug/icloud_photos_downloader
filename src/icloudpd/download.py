@@ -103,6 +103,36 @@ def download_response_to_path_dry_run(
     return True
 
 
+
+def cleanup_orphaned_part_files(logger: logging.Logger, download_dir: str, dry_run: bool) -> None:
+    """Remove .part files left behind by previously crashed download sessions.
+
+    .part files are temporary files used for resumable downloads. If the process
+    crashed mid-download, these files remain and should be cleaned up.
+
+    Args:
+        logger: Logger instance
+        download_dir: Root directory to scan recursively for orphaned .part files
+        dry_run: If True, only log what would be deleted
+    """
+    if not os.path.isdir(download_dir):
+        return
+    count = 0
+    for root, _dirs, files in os.walk(download_dir):
+        for entry in files:
+            if entry.endswith(".part"):
+                part_path = os.path.join(root, entry)
+                try:
+                    if dry_run:
+                        logger.debug("[DRY RUN] Would remove orphaned .part file %s", part_path)
+                    else:
+                        os.remove(part_path)
+                        count += 1
+                except OSError:
+                    pass  # File may be in use by another process; skip silently
+    if count > 0:
+        logger.info("Cleaned up %d orphaned .part file(s) from previous sessions", count)
+
 def download_media(
     logger: logging.Logger,
     dry_run: bool,

@@ -4,7 +4,7 @@ from unittest import TestCase
 
 import pytest
 
-from icloudpd.base import lp_filename_concatinator, lp_filename_original
+from icloudpd.base import lp_filename_concatenator, lp_filename_original
 from tests.helpers import (
     path_from_project_root,
     run_icloudpd_test,
@@ -19,11 +19,11 @@ class DownloadLivePhotoTestCase(TestCase):
 
     def test_lp_filename_generator(self) -> None:
         self.assertEqual(
-            lp_filename_concatinator("IMG_1234.HEIC"), "IMG_1234_HEVC.MOV", "happy path HEIC"
+            lp_filename_concatenator("IMG_1234.HEIC"), "IMG_1234_HEVC.MOV", "happy path HEIC"
         )
-        self.assertEqual(lp_filename_concatinator("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")
-        self.assertEqual(lp_filename_concatinator("IMG_1234"), "IMG_1234", "no ext")
-        self.assertEqual(lp_filename_concatinator("IMG.1234.HEIC"), "IMG.1234_HEVC.MOV", "dots")
+        self.assertEqual(lp_filename_concatenator("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")
+        self.assertEqual(lp_filename_concatenator("IMG_1234"), "IMG_1234", "no ext")
+        self.assertEqual(lp_filename_concatenator("IMG.1234.HEIC"), "IMG.1234_HEVC.MOV", "dots")
 
         self.assertEqual(lp_filename_original("IMG_1234.HEIC"), "IMG_1234.MOV", "happy path HEIC")
         self.assertEqual(lp_filename_original("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")

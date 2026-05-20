@@ -2,7 +2,7 @@ from typing import Any, Callable, Dict
 from unittest import TestCase
 from unittest.mock import Mock
 
-from icloudpd.base import lp_filename_concatinator as mock_lp_filename_generator
+from icloudpd.base import lp_filename_concatenator as mock_lp_filename_generator
 from pyicloud_ipd.asset_version import AssetVersion
 from pyicloud_ipd.utils import disambiguate_filenames
 from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize, VersionSize

@@ -38,6 +38,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from tzlocal import get_localzone
 
 from foundation.core import compose, identity, map_, partial_1_1
+from foundation.string_utils import endswith, eq, lower, replace_extension
 from icloudpd import download, exif_datetime
 from icloudpd.authentication import authenticator
 from icloudpd.autodelete import autodelete_photos
@@ -101,25 +102,20 @@ def build_filename_cleaner(keep_unicode: bool) -> Callable[[str], str]:
         return remove_unicode_chars
 
 
-def lp_filename_concatinator(filename: str) -> str:
+def lp_filename_concatenator(filename: str) -> str:
     """Generate concatenator-style live photo filename, adding HEVC suffix for HEIC files"""
     import os
-
-    from foundation.core import compose
-    from foundation.string_utils import endswith, lower
 
     name, ext = os.path.splitext(filename)
     if not ext:
         return filename
 
-    is_heic = compose(endswith(".heic"), lower)(ext)
+    is_heic = ext.lower().endswith(".heic")
     return name + ("_HEVC.MOV" if is_heic else ".MOV")
 
 
 def lp_filename_original(filename: str) -> str:
     """Generate original-style live photo filename by replacing extension with .MOV"""
-    from foundation.string_utils import replace_extension
-
     replace_with_mov = replace_extension(".MOV")
     return replace_with_mov(filename)
 
@@ -216,11 +212,9 @@ def create_logger(config: GlobalConfig) -> logging.Logger:
     )
     logger = logging.getLogger("icloudpd")
     if config.only_print_filenames:
-        logger.disabled = True
+        # Only suppress info/debug messages, keep errors visible
+        logger.setLevel(logging.ERROR)
     else:
-        # Need to make sure disabled is reset to the correct value,
-        # because the logger instance is shared between tests.
-        logger.disabled = False
         if config.log_level == LogLevel.DEBUG:
             logger.setLevel(logging.DEBUG)
         elif config.log_level == LogLevel.INFO:
@@ -374,7 +368,7 @@ def _process_all_users_once(
             lp_filename_generator = (
                 lp_filename_original
                 if user_config.live_photo_mov_filename_policy == LivePhotoMovFilenamePolicy.ORIGINAL
-                else lp_filename_concatinator
+                else lp_filename_concatenator
             )
 
             # Set up filename cleaner based on user preference
@@ -589,12 +583,7 @@ def download_builder(
         logger.error("Could not convert photo created date to local timezone (%s)", photo.created)
         created_date = photo.created
 
-    from foundation.core import compose
-    from foundation.string_utils import eq, lower
-
-    is_none_folder = compose(eq("none"), lower)
-
-    if is_none_folder(folder_structure):
+    if folder_structure.lower() == "none":
         date_path = ""
     else:
         try:
@@ -704,15 +693,10 @@ def download_builder(
                 success = download_result
 
                 if download_result:
-                    from foundation.core import compose
-                    from foundation.string_utils import endswith, lower
-
-                    is_jpeg = compose(endswith((".jpg", ".jpeg")), lower)
-
                     if (
                         not dry_run
                         and set_exif_datetime
-                        and is_jpeg(filename)
+                        and filename.lower().endswith((".jpg", ".jpeg"))
                         and not exif_datetime.get_photo_exif(logger, download_path)
                     ):
                         # %Y:%m:%d looks wrong, but it's the correct format
@@ -872,6 +856,85 @@ def asset_type_skip_message(
     return f"Skipping {filename}, only downloading {photo_video_phrase}. (Item type was: {photo.item_type})"
 
 
+
+def _process_asset_item(
+    logger: logging.Logger,
+    user_config: UserConfig,
+    library_object: PhotoLibrary,
+    photo_album: PhotoAlbum,
+    item: PhotoAsset,
+    passer: Callable[[PhotoAsset], bool],
+    download_photo: Callable[[Counter, PhotoAsset], bool],
+    consecutive_files_found: Counter,
+    status_exchange: StatusExchange,
+    now: datetime.datetime,
+) -> bool:
+    """Process a single photo asset: filter, download, conditional delete.
+    
+    Returns True if the asset passed the filter (even if download failed).
+    """
+    passer_result = passer(item)
+    if not passer_result:
+        return False
+
+    download_result = passer_result and download_photo(consecutive_files_found, item)
+    should_delete = download_result and user_config.delete_after_download
+
+    if passer_result and user_config.keep_icloud_recent_days is not None:
+        created_date = item.created.astimezone(get_localzone())
+        age_days = (now - created_date).days
+        logger.debug(f"Created date: {created_date}")
+        logger.debug(f"Keep iCloud recent days: {user_config.keep_icloud_recent_days}")
+        logger.debug(f"Age days: {age_days}")
+        if age_days < user_config.keep_icloud_recent_days:
+            filename_cleaner_for_debug = build_filename_cleaner(user_config.keep_unicode_in_filenames)
+            debug_filename = build_filename_with_policies(
+                user_config.file_match_policy, filename_cleaner_for_debug, item
+            )
+            logger.debug(
+                "Skipping deletion of %s as it is within the keep_icloud_recent_days period (%d days old)",
+                debug_filename,
+                age_days,
+            )
+        else:
+            should_delete = True
+
+    if should_delete:
+        filename_cleaner_for_delete = build_filename_cleaner(user_config.keep_unicode_in_filenames)
+        filename_builder_for_delete = create_filename_builder(
+            user_config.file_match_policy, filename_cleaner_for_delete
+        )
+        if user_config.dry_run:
+            delete_photo_dry_run(logger, library_object, item, filename_builder_for_delete)
+        else:
+            delete_photo(logger, library_object, item, filename_builder_for_delete)
+        photo_album.increment_offset(-1)
+
+    return True
+
+
+def _handle_error_with_webui_retry(
+    logger: logging.Logger,
+    error: Exception,
+    captured_responses: List[Mapping[str, Any]],
+    status_exchange: StatusExchange,
+    global_config: GlobalConfig,
+    return_on_failure: int = 1,
+) -> int | None:
+    """Handle download errors that may allow webui retry.
+    
+    Returns None to retry (continue), or an error code to return immediately.
+    """
+    logger.info(error)
+    dump_responses(logger.debug, captured_responses)
+    if (
+        PasswordProvider.WEBUI in global_config.password_providers
+        or global_config.mfa_provider == MFAProvider.WEBUI
+    ):
+        if update_auth_error_in_webui(status_exchange, str(error)):
+            return None  # retry
+    return return_on_failure
+
 def core_single_run(
     logger: logging.Logger,
     status_exchange: StatusExchange,
@@ -960,6 +1023,11 @@ def core_single_run(
                         pass
 
                     directory = os.path.normpath(user_config.directory)
+
+                    # Clean up .part files from previously crashed sessions
+                    download.cleanup_orphaned_part_files(
+                        logger, directory, user_config.dry_run
+                    )
 
                     if user_config.skip_photos or user_config.skip_videos:
                         photo_video_phrase = "photos" if user_config.skip_videos else "videos"
@@ -1070,85 +1138,25 @@ def core_single_run(
                         download_photo = partial(downloader, icloud)
 
                         for item in photos_bar:
-                            try:
-                                if should_break(consecutive_files_found):
-                                    logger.info(
-                                        "Found %s consecutive previously downloaded photos. Exiting",
-                                        user_config.until_found,
-                                    )
-                                    break
-                                # item = next(photos_iterator)
-                                should_delete = False
-
-                                passer_result = passer(item)
-                                download_result = passer_result and download_photo(
-                                    consecutive_files_found, item
+                            if should_break(consecutive_files_found):
+                                logger.info(
+                                    "Found %s consecutive previously downloaded photos. Exiting",
+                                    user_config.until_found,
                                 )
-                                if download_result and user_config.delete_after_download:
-                                    should_delete = True
+                                break
 
-                                if (
-                                    passer_result
-                                    and user_config.keep_icloud_recent_days is not None
-                                ):
-                                    created_date = item.created.astimezone(get_localzone())
-                                    age_days = (now - created_date).days
-                                    logger.debug(f"Created date: {created_date}")
-                                    logger.debug(
-                                        f"Keep iCloud recent days: {user_config.keep_icloud_recent_days}"
-                                    )
-                                    logger.debug(f"Age days: {age_days}")
-                                    if age_days < user_config.keep_icloud_recent_days:
-                                        # Create filename cleaner for debug message
-                                        filename_cleaner_for_debug = build_filename_cleaner(
-                                            user_config.keep_unicode_in_filenames
-                                        )
-                                        debug_filename = build_filename_with_policies(
-                                            user_config.file_match_policy,
-                                            filename_cleaner_for_debug,
-                                            item,
-                                        )
-                                        logger.debug(
-                                            "Skipping deletion of %s as it is within the keep_icloud_recent_days period (%d days old)",
-                                            debug_filename,
-                                            age_days,
-                                        )
-                                    else:
-                                        should_delete = True
+                            processed = _process_asset_item(
+                                logger, user_config, library_object, photo_album,
+                                item, passer, download_photo, consecutive_files_found,
+                                status_exchange, now
+                            )
+                            if not processed:
+                                continue
 
-                                if should_delete:
-                                    # Create filename cleaner and builder for delete operations
-                                    filename_cleaner_for_delete = build_filename_cleaner(
-                                        user_config.keep_unicode_in_filenames
-                                    )
-                                    filename_builder_for_delete = create_filename_builder(
-                                        user_config.file_match_policy, filename_cleaner_for_delete
-                                    )
-                                    if user_config.dry_run:
-                                        delete_photo_dry_run(
-                                            logger,
-                                            library_object,
-                                            item,
-                                            filename_builder_for_delete,
-                                        )
-                                    else:
-                                        delete_photo(
-                                            logger,
-                                            library_object,
-                                            item,
-                                            filename_builder_for_delete,
-                                        )
+                            photos_counter += 1
+                            status_exchange.get_progress().photos_counter = photos_counter
 
-                                    # retrier(delete_local, error_handler)
-                                    photo_album.increment_offset(-1)
-
-                                photos_counter += 1
-                                status_exchange.get_progress().photos_counter = photos_counter
-
-                                if status_exchange.get_progress().cancel:
-                                    break
-
-                            except StopIteration:
+                            if status_exchange.get_progress().cancel:
                                 break
 
                         if global_config.only_print_filenames:
@@ -1184,24 +1192,21 @@ def core_single_run(
                             lp_filename_generator,
                             user_config.align_raw,
                         )
-                    else:
-                        pass
         except PyiCloudFailedLoginException as error:
-            logger.info(error)
-            dump_responses(logger.debug, captured_responses)
-            if PasswordProvider.WEBUI in global_config.password_providers:
-                update_auth_error_in_webui(status_exchange, str(error))
+            result = _handle_error_with_webui_retry(
+                logger, error, captured_responses, status_exchange, global_config
+            )
+            if result is None:
                 continue
-            else:
-                return 1
+            return result
         except PyiCloudFailedMFAException as error:
-            logger.info(str(error))
-            dump_responses(logger.debug, captured_responses)
             if global_config.mfa_provider == MFAProvider.WEBUI:
+                logger.info(str(error))
+                dump_responses(logger.debug, captured_responses)
                 update_auth_error_in_webui(status_exchange, str(error))
                 continue
-            else:
-                return 1
+            logger.info(str(error))
+            return 1
         except (
             PyiCloudServiceNotActivatedException,
             PyiCloudServiceUnavailableException,

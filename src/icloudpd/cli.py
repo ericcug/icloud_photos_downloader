@@ -616,7 +616,7 @@ def validate_folder_structure(folder_structure: str) -> str:
         try:
             folder_structure.format(datetime.datetime.now())
             return folder_structure
-        except:  # noqa E722
+        except Exception:
             raise argparse.ArgumentTypeError(
                 f"Format {folder_structure} specified in --folder-structure is incorrect"
             ) from None

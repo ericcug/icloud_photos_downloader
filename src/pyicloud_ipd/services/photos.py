@@ -14,6 +14,7 @@ from tzlocal import get_localzone
 
 from foundation import bytes_decode, wrap_param_in_exception
 from foundation.core import compose, identity
+from foundation.string_utils import endswith, lower
 from foundation.core.optional import fromMaybe
 from icloudpd.paths import clean_filename
 from pyicloud_ipd.asset_version import (
@@ -553,6 +554,18 @@ class PhotoAlbum:
                     yield PhotoAsset(master_record, asset_records[record_name])
                     self.increment_offset(1)
             else:
+                if self.offset == 0:
+                    logger.warning(
+                        "Photo album '%s' returned no photos from iCloud API. "
+                        "Session may need re-authentication.",
+                        self.name or "All Photos",
+                    )
+                else:
+                    logger.debug(
+                        "Photo album '%s' pagination complete at offset %d.",
+                        self.name or "All Photos",
+                        self.offset,
+                    )
                 break
 
     def increment_offset(self, value: int) -> None:
@@ -893,12 +906,8 @@ class PhotoAsset:
         item_type = item_type_field["value"]
         if item_type in self.ITEM_TYPES:
             return self.ITEM_TYPES[item_type]
-        from foundation.core import compose
-        from foundation.string_utils import endswith, lower
 
-        is_image_ext = compose(endswith((".heic", ".png", ".jpg", ".jpeg")), lower)
-
-        if is_image_ext(self.filename):
+        if self.filename.lower().endswith((".heic", ".png", ".jpg", ".jpeg")):
             return AssetItemType.IMAGE
         return AssetItemType.MOVIE
 

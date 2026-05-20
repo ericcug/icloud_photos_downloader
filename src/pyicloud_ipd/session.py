@@ -31,13 +31,14 @@ HEADER_DATA = {
 
 class PyiCloudPasswordFilter(logging.Filter):
     def __init__(self, password: str):
-        super().__init__(password)
+        super().__init__("pyicloud_password_filter")
+        self._password = password
 
     @override
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
-        if self.name in message:
-            record.msg = message.replace(self.name, "********")
+        if self._password in message:
+            record.msg = message.replace(self._password, "********")
             record.args = []  # type: ignore[assignment]
 
         return True
