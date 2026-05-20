@@ -38,7 +38,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
 from tzlocal import get_localzone
 
 from foundation.core import compose, identity, map_, partial_1_1
-from foundation.string_utils import endswith, eq, lower, replace_extension
+from foundation.string_utils import replace_extension
 from icloudpd import download, exif_datetime
 from icloudpd.authentication import authenticator
 from icloudpd.autodelete import autodelete_photos
@@ -930,9 +930,8 @@ def _handle_error_with_webui_retry(
     if (
         PasswordProvider.WEBUI in global_config.password_providers
         or global_config.mfa_provider == MFAProvider.WEBUI
-    ):
-        if update_auth_error_in_webui(status_exchange, str(error)):
-            return None  # retry
+    ) and update_auth_error_in_webui(status_exchange, str(error)):
+        return None  # retry
     return return_on_failure
 
 def core_single_run(

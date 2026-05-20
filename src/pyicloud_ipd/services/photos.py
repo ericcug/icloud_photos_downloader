@@ -14,7 +14,6 @@ from tzlocal import get_localzone
 
 from foundation import bytes_decode, wrap_param_in_exception
 from foundation.core import compose, identity
-from foundation.string_utils import endswith, lower
 from foundation.core.optional import fromMaybe
 from icloudpd.paths import clean_filename
 from pyicloud_ipd.asset_version import (
