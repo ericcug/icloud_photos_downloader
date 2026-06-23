@@ -1,0 +1,608 @@
+diff --git a/src/icloudpd/base.py b/src/icloudpd/base.py
+index 2c9fe24..e059763 100644
+--- a/src/icloudpd/base.py
++++ b/src/icloudpd/base.py
+@@ -38,6 +38,7 @@ from tqdm.contrib.logging import logging_redirect_tqdm
+ from tzlocal import get_localzone
+ 
+ from foundation.core import compose, identity, map_, partial_1_1
++from foundation.string_utils import replace_extension
+ from icloudpd import download, exif_datetime
+ from icloudpd.authentication import authenticator
+ from icloudpd.autodelete import autodelete_photos
+@@ -101,25 +102,20 @@ def build_filename_cleaner(keep_unicode: bool) -> Callable[[str], str]:
+         return remove_unicode_chars
+ 
+ 
+-def lp_filename_concatinator(filename: str) -> str:
++def lp_filename_concatenator(filename: str) -> str:
+     """Generate concatenator-style live photo filename, adding HEVC suffix for HEIC files"""
+     import os
+ 
+-    from foundation.core import compose
+-    from foundation.string_utils import endswith, lower
+-
+     name, ext = os.path.splitext(filename)
+     if not ext:
+         return filename
+ 
+-    is_heic = compose(endswith(".heic"), lower)(ext)
++    is_heic = ext.lower().endswith(".heic")
+     return name + ("_HEVC.MOV" if is_heic else ".MOV")
+ 
+ 
+ def lp_filename_original(filename: str) -> str:
+     """Generate original-style live photo filename by replacing extension with .MOV"""
+-    from foundation.string_utils import replace_extension
+-
+     replace_with_mov = replace_extension(".MOV")
+     return replace_with_mov(filename)
+ 
+@@ -216,11 +212,9 @@ def create_logger(config: GlobalConfig) -> logging.Logger:
+     )
+     logger = logging.getLogger("icloudpd")
+     if config.only_print_filenames:
+-        logger.disabled = True
++        # Only suppress info/debug messages, keep errors visible
++        logger.setLevel(logging.ERROR)
+     else:
+-        # Need to make sure disabled is reset to the correct value,
+-        # because the logger instance is shared between tests.
+-        logger.disabled = False
+         if config.log_level == LogLevel.DEBUG:
+             logger.setLevel(logging.DEBUG)
+         elif config.log_level == LogLevel.INFO:
+@@ -374,7 +368,7 @@ def _process_all_users_once(
+             lp_filename_generator = (
+                 lp_filename_original
+                 if user_config.live_photo_mov_filename_policy == LivePhotoMovFilenamePolicy.ORIGINAL
+-                else lp_filename_concatinator
++                else lp_filename_concatenator
+             )
+ 
+             # Set up filename cleaner based on user preference
+@@ -589,12 +583,7 @@ def download_builder(
+         logger.error("Could not convert photo created date to local timezone (%s)", photo.created)
+         created_date = photo.created
+ 
+-    from foundation.core import compose
+-    from foundation.string_utils import eq, lower
+-
+-    is_none_folder = compose(eq("none"), lower)
+-
+-    if is_none_folder(folder_structure):
++    if folder_structure.lower() == "none":
+         date_path = ""
+     else:
+         try:
+@@ -704,15 +693,10 @@ def download_builder(
+                 success = download_result
+ 
+                 if download_result:
+-                    from foundation.core import compose
+-                    from foundation.string_utils import endswith, lower
+-
+-                    is_jpeg = compose(endswith((".jpg", ".jpeg")), lower)
+-
+                     if (
+                         not dry_run
+                         and set_exif_datetime
+-                        and is_jpeg(filename)
++                        and filename.lower().endswith((".jpg", ".jpeg"))
+                         and not exif_datetime.get_photo_exif(logger, download_path)
+                     ):
+                         # %Y:%m:%d looks wrong, but it's the correct format
+@@ -872,6 +856,84 @@ def asset_type_skip_message(
+     return f"Skipping {filename}, only downloading {photo_video_phrase}. (Item type was: {photo.item_type})"
+ 
+ 
++
++def _process_asset_item(
++    logger: logging.Logger,
++    user_config: UserConfig,
++    library_object: PhotoLibrary,
++    photo_album: PhotoAlbum,
++    item: PhotoAsset,
++    passer: Callable[[PhotoAsset], bool],
++    download_photo: Callable[[Counter, PhotoAsset], bool],
++    consecutive_files_found: Counter,
++    status_exchange: StatusExchange,
++    now: datetime.datetime,
++) -> bool:
++    """Process a single photo asset: filter, download, conditional delete.
++    
++    Returns True if the asset passed the filter (even if download failed).
++    """
++    passer_result = passer(item)
++    if not passer_result:
++        return False
++
++    download_result = passer_result and download_photo(consecutive_files_found, item)
++    should_delete = download_result and user_config.delete_after_download
++
++    if passer_result and user_config.keep_icloud_recent_days is not None:
++        created_date = item.created.astimezone(get_localzone())
++        age_days = (now - created_date).days
++        logger.debug(f"Created date: {created_date}")
++        logger.debug(f"Keep iCloud recent days: {user_config.keep_icloud_recent_days}")
++        logger.debug(f"Age days: {age_days}")
++        if age_days < user_config.keep_icloud_recent_days:
++            filename_cleaner_for_debug = build_filename_cleaner(user_config.keep_unicode_in_filenames)
++            debug_filename = build_filename_with_policies(
++                user_config.file_match_policy, filename_cleaner_for_debug, item
++            )
++            logger.debug(
++                "Skipping deletion of %s as it is within the keep_icloud_recent_days period (%d days old)",
++                debug_filename,
++                age_days,
++            )
++        else:
++            should_delete = True
++
++    if should_delete:
++        filename_cleaner_for_delete = build_filename_cleaner(user_config.keep_unicode_in_filenames)
++        filename_builder_for_delete = create_filename_builder(
++            user_config.file_match_policy, filename_cleaner_for_delete
++        )
++        if user_config.dry_run:
++            delete_photo_dry_run(logger, library_object, item, filename_builder_for_delete)
++        else:
++            delete_photo(logger, library_object, item, filename_builder_for_delete)
++        photo_album.increment_offset(-1)
++
++    return True
++
++
++def _handle_error_with_webui_retry(
++    logger: logging.Logger,
++    error: Exception,
++    captured_responses: List[Mapping[str, Any]],
++    status_exchange: StatusExchange,
++    global_config: GlobalConfig,
++    return_on_failure: int = 1,
++) -> int | None:
++    """Handle download errors that may allow webui retry.
++    
++    Returns None to retry (continue), or an error code to return immediately.
++    """
++    logger.info(error)
++    dump_responses(logger.debug, captured_responses)
++    if (
++        PasswordProvider.WEBUI in global_config.password_providers
++        or global_config.mfa_provider == MFAProvider.WEBUI
++    ) and update_auth_error_in_webui(status_exchange, str(error)):
++        return None  # retry
++    return return_on_failure
++
+ def core_single_run(
+     logger: logging.Logger,
+     status_exchange: StatusExchange,
+@@ -1070,85 +1132,25 @@ def core_single_run(
+                         download_photo = partial(downloader, icloud)
+ 
+                         for item in photos_bar:
+-                            try:
+-                                if should_break(consecutive_files_found):
+-                                    logger.info(
+-                                        "Found %s consecutive previously downloaded photos. Exiting",
+-                                        user_config.until_found,
+-                                    )
+-                                    break
+-                                # item = next(photos_iterator)
+-                                should_delete = False
+-
+-                                passer_result = passer(item)
+-                                download_result = passer_result and download_photo(
+-                                    consecutive_files_found, item
++                            if should_break(consecutive_files_found):
++                                logger.info(
++                                    "Found %s consecutive previously downloaded photos. Exiting",
++                                    user_config.until_found,
+                                 )
+-                                if download_result and user_config.delete_after_download:
+-                                    should_delete = True
+-
+-                                if (
+-                                    passer_result
+-                                    and user_config.keep_icloud_recent_days is not None
+-                                ):
+-                                    created_date = item.created.astimezone(get_localzone())
+-                                    age_days = (now - created_date).days
+-                                    logger.debug(f"Created date: {created_date}")
+-                                    logger.debug(
+-                                        f"Keep iCloud recent days: {user_config.keep_icloud_recent_days}"
+-                                    )
+-                                    logger.debug(f"Age days: {age_days}")
+-                                    if age_days < user_config.keep_icloud_recent_days:
+-                                        # Create filename cleaner for debug message
+-                                        filename_cleaner_for_debug = build_filename_cleaner(
+-                                            user_config.keep_unicode_in_filenames
+-                                        )
+-                                        debug_filename = build_filename_with_policies(
+-                                            user_config.file_match_policy,
+-                                            filename_cleaner_for_debug,
+-                                            item,
+-                                        )
+-                                        logger.debug(
+-                                            "Skipping deletion of %s as it is within the keep_icloud_recent_days period (%d days old)",
+-                                            debug_filename,
+-                                            age_days,
+-                                        )
+-                                    else:
+-                                        should_delete = True
+-
+-                                if should_delete:
+-                                    # Create filename cleaner and builder for delete operations
+-                                    filename_cleaner_for_delete = build_filename_cleaner(
+-                                        user_config.keep_unicode_in_filenames
+-                                    )
+-                                    filename_builder_for_delete = create_filename_builder(
+-                                        user_config.file_match_policy, filename_cleaner_for_delete
+-                                    )
+-                                    if user_config.dry_run:
+-                                        delete_photo_dry_run(
+-                                            logger,
+-                                            library_object,
+-                                            item,
+-                                            filename_builder_for_delete,
+-                                        )
+-                                    else:
+-                                        delete_photo(
+-                                            logger,
+-                                            library_object,
+-                                            item,
+-                                            filename_builder_for_delete,
+-                                        )
+-
+-                                    # retrier(delete_local, error_handler)
+-                                    photo_album.increment_offset(-1)
+-
+-                                photos_counter += 1
+-                                status_exchange.get_progress().photos_counter = photos_counter
+-
+-                                if status_exchange.get_progress().cancel:
+-                                    break
+-
+-                            except StopIteration:
++                                break
++
++                            processed = _process_asset_item(
++                                logger, user_config, library_object, photo_album,
++                                item, passer, download_photo, consecutive_files_found,
++                                status_exchange, now
++                            )
++                            if not processed:
++                                continue
++
++                            photos_counter += 1
++                            status_exchange.get_progress().photos_counter = photos_counter
++
++                            if status_exchange.get_progress().cancel:
+                                 break
+ 
+                         if global_config.only_print_filenames:
+@@ -1173,6 +1175,11 @@ def core_single_run(
+                             status_exchange.get_progress().photos_last_message = message
+                         status_exchange.get_progress().reset()
+ 
++                    # Clean up .part files from previously crashed sessions
++                    download.cleanup_orphaned_part_files(
++                        logger, directory, user_config.dry_run
++                    )
++
+                     if user_config.auto_delete:
+                         autodelete_photos(
+                             logger,
+@@ -1184,24 +1191,21 @@ def core_single_run(
+                             lp_filename_generator,
+                             user_config.align_raw,
+                         )
+-                    else:
+-                        pass
+         except PyiCloudFailedLoginException as error:
+-            logger.info(error)
+-            dump_responses(logger.debug, captured_responses)
+-            if PasswordProvider.WEBUI in global_config.password_providers:
+-                update_auth_error_in_webui(status_exchange, str(error))
++            result = _handle_error_with_webui_retry(
++                logger, error, captured_responses, status_exchange, global_config
++            )
++            if result is None:
+                 continue
+-            else:
+-                return 1
++            return result
+         except PyiCloudFailedMFAException as error:
+-            logger.info(str(error))
+-            dump_responses(logger.debug, captured_responses)
+             if global_config.mfa_provider == MFAProvider.WEBUI:
++                logger.info(str(error))
++                dump_responses(logger.debug, captured_responses)
+                 update_auth_error_in_webui(status_exchange, str(error))
+                 continue
+-            else:
+-                return 1
++            logger.info(str(error))
++            return 1
+         except (
+             PyiCloudServiceNotActivatedException,
+             PyiCloudServiceUnavailableException,
+diff --git a/src/icloudpd/cli.py b/src/icloudpd/cli.py
+index 9c33ac1..061dec8 100644
+--- a/src/icloudpd/cli.py
++++ b/src/icloudpd/cli.py
+@@ -616,7 +616,7 @@ def validate_folder_structure(folder_structure: str) -> str:
+         try:
+             folder_structure.format(datetime.datetime.now())
+             return folder_structure
+-        except:  # noqa E722
++        except Exception:
+             raise argparse.ArgumentTypeError(
+                 f"Format {folder_structure} specified in --folder-structure is incorrect"
+             ) from None
+diff --git a/src/icloudpd/counter.py b/src/icloudpd/counter.py
+index 06b1e80..8cd486d 100644
+--- a/src/icloudpd/counter.py
++++ b/src/icloudpd/counter.py
+@@ -15,7 +15,7 @@ class Counter:
+ 
+     def reset(self) -> None:
+         with self.lock:
+-            self.val = RawValue("i", self.initial_value)
++            self.val.value = self.initial_value
+ 
+     def value(self) -> int:
+         with self.lock:
+diff --git a/src/icloudpd/download.py b/src/icloudpd/download.py
+index 78da134..fc96a83 100644
+--- a/src/icloudpd/download.py
++++ b/src/icloudpd/download.py
+@@ -103,6 +103,36 @@ def download_response_to_path_dry_run(
+     return True
+ 
+ 
++
++def cleanup_orphaned_part_files(logger: logging.Logger, download_dir: str, dry_run: bool) -> None:
++    """Remove .part files left behind by previously crashed download sessions.
++
++    .part files are temporary files used for resumable downloads. If the process
++    crashed mid-download, these files remain and should be cleaned up.
++
++    Args:
++        logger: Logger instance
++        download_dir: Root directory to scan recursively for orphaned .part files
++        dry_run: If True, only log what would be deleted
++    """
++    if not os.path.isdir(download_dir):
++        return
++    count = 0
++    for root, _dirs, files in os.walk(download_dir):
++        for entry in files:
++            if entry.endswith(".part"):
++                part_path = os.path.join(root, entry)
++                try:
++                    if dry_run:
++                        logger.debug("[DRY RUN] Would remove orphaned .part file %s", part_path)
++                    else:
++                        os.remove(part_path)
++                        count += 1
++                except OSError:
++                    pass  # File may be in use by another process; skip silently
++    if count > 0:
++        logger.info("Cleaned up %d orphaned .part file(s) from previous sessions", count)
++
+ def download_media(
+     logger: logging.Logger,
+     dry_run: bool,
+diff --git a/src/pyicloud_ipd/base.py b/src/pyicloud_ipd/base.py
+index 409460e..5a17e42 100644
+--- a/src/pyicloud_ipd/base.py
++++ b/src/pyicloud_ipd/base.py
+@@ -723,6 +723,7 @@ class PyiCloudService:
+         except PyiCloudAPIResponseException:
+             return False
+ 
++
+     def send_2fa_code_sms(self, device_id: int) -> bool:
+         """Requests that a verification code is sent to the given device"""
+ 
+diff --git a/src/pyicloud_ipd/exceptions.py b/src/pyicloud_ipd/exceptions.py
+index e698e2b..6469f06 100644
+--- a/src/pyicloud_ipd/exceptions.py
++++ b/src/pyicloud_ipd/exceptions.py
+@@ -70,31 +70,6 @@ class PyiCloudNoDevicesException(PyiCloudException):
+     pass
+ 
+ 
+-# Potentially Deprecated - Further review needed
++# PyiCloudConnectionException is actively used in base.py for domain mismatch
+ class PyiCloudConnectionException(PyiCloudException):
+     pass
+-
+-
+-class PyiCloudAPIResponseError(PyiCloudException):
+-    def __init__(self, reason: str, code: (int | None)):
+-        self.reason = reason
+-        self.code = code
+-        message = reason
+-        if code:
+-            message += f" ({code})"
+-
+-        super().__init__(message)
+-
+-
+-class PyiCloud2SARequiredError(PyiCloudException):
+-    def __init__(self, url: str):
+-        message = f"Two-step authentication required for {url}"
+-        super().__init__(message)
+-
+-
+-class NoStoredPasswordAvailable(PyiCloudException):
+-    pass
+-
+-
+-class PyiCloudServiceNotActivatedErrror(PyiCloudAPIResponseError):
+-    pass
+diff --git a/src/pyicloud_ipd/services/photos.py b/src/pyicloud_ipd/services/photos.py
+index 12e5c0b..840ebe7 100644
+--- a/src/pyicloud_ipd/services/photos.py
++++ b/src/pyicloud_ipd/services/photos.py
+@@ -553,6 +553,18 @@ class PhotoAlbum:
+                     yield PhotoAsset(master_record, asset_records[record_name])
+                     self.increment_offset(1)
+             else:
++                if self.offset == 0:
++                    logger.warning(
++                        "Photo album '%s' returned no photos from iCloud API. "
++                        "Session may need re-authentication.",
++                        self.name or "All Photos",
++                    )
++                else:
++                    logger.debug(
++                        "Photo album '%s' pagination complete at offset %d.",
++                        self.name or "All Photos",
++                        self.offset,
++                    )
+                 break
+ 
+     def increment_offset(self, value: int) -> None:
+@@ -893,12 +905,8 @@ class PhotoAsset:
+         item_type = item_type_field["value"]
+         if item_type in self.ITEM_TYPES:
+             return self.ITEM_TYPES[item_type]
+-        from foundation.core import compose
+-        from foundation.string_utils import endswith, lower
+-
+-        is_image_ext = compose(endswith((".heic", ".png", ".jpg", ".jpeg")), lower)
+ 
+-        if is_image_ext(self.filename):
++        if self.filename.lower().endswith((".heic", ".png", ".jpg", ".jpeg")):
+             return AssetItemType.IMAGE
+         return AssetItemType.MOVIE
+ 
+diff --git a/src/pyicloud_ipd/session.py b/src/pyicloud_ipd/session.py
+index 23791c0..c218b4c 100644
+--- a/src/pyicloud_ipd/session.py
++++ b/src/pyicloud_ipd/session.py
+@@ -31,13 +31,14 @@ HEADER_DATA = {
+ 
+ class PyiCloudPasswordFilter(logging.Filter):
+     def __init__(self, password: str):
+-        super().__init__(password)
++        super().__init__("pyicloud_password_filter")
++        self._password = password
+ 
+     @override
+     def filter(self, record: logging.LogRecord) -> bool:
+         message = record.getMessage()
+-        if self.name in message:
+-            record.msg = message.replace(self.name, "********")
++        if self._password in message:
++            record.msg = message.replace(self._password, "********")
+             record.args = []  # type: ignore[assignment]
+ 
+         return True
+diff --git a/src/pyicloud_ipd/utils.py b/src/pyicloud_ipd/utils.py
+index d288652..2db4429 100644
+--- a/src/pyicloud_ipd/utils.py
++++ b/src/pyicloud_ipd/utils.py
+@@ -218,7 +218,7 @@ def handle_connection_error(func: F) -> F:
+             return func(*args, **kwargs)
+         except (ConnectionError, TimeoutError, Timeout, NewConnectionError) as error:
+             raise PyiCloudConnectionErrorException(
+-                "Cannot connect to Apple iCloud service"
++                f"Cannot connect to Apple iCloud service. Details: {error}"
+             ) from error
+ 
+     return wrapper  # type: ignore[return-value]
+diff --git a/tests/test_download_live_photos.py b/tests/test_download_live_photos.py
+index 1907a00..eac8c73 100644
+--- a/tests/test_download_live_photos.py
++++ b/tests/test_download_live_photos.py
+@@ -4,7 +4,7 @@ from unittest import TestCase
+ 
+ import pytest
+ 
+-from icloudpd.base import lp_filename_concatinator, lp_filename_original
++from icloudpd.base import lp_filename_concatenator, lp_filename_original
+ from tests.helpers import (
+     path_from_project_root,
+     run_icloudpd_test,
+@@ -19,11 +19,11 @@ class DownloadLivePhotoTestCase(TestCase):
+ 
+     def test_lp_filename_generator(self) -> None:
+         self.assertEqual(
+-            lp_filename_concatinator("IMG_1234.HEIC"), "IMG_1234_HEVC.MOV", "happy path HEIC"
++            lp_filename_concatenator("IMG_1234.HEIC"), "IMG_1234_HEVC.MOV", "happy path HEIC"
+         )
+-        self.assertEqual(lp_filename_concatinator("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")
+-        self.assertEqual(lp_filename_concatinator("IMG_1234"), "IMG_1234", "no ext")
+-        self.assertEqual(lp_filename_concatinator("IMG.1234.HEIC"), "IMG.1234_HEVC.MOV", "dots")
++        self.assertEqual(lp_filename_concatenator("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")
++        self.assertEqual(lp_filename_concatenator("IMG_1234"), "IMG_1234", "no ext")
++        self.assertEqual(lp_filename_concatenator("IMG.1234.HEIC"), "IMG.1234_HEVC.MOV", "dots")
+ 
+         self.assertEqual(lp_filename_original("IMG_1234.HEIC"), "IMG_1234.MOV", "happy path HEIC")
+         self.assertEqual(lp_filename_original("IMG_1234.JPG"), "IMG_1234.MOV", "happy path JPG")
+diff --git a/tests/test_filenames.py b/tests/test_filenames.py
+index bdb3bc8..45b8cf9 100644
+--- a/tests/test_filenames.py
++++ b/tests/test_filenames.py
+@@ -2,7 +2,7 @@ from typing import Any, Callable, Dict
+ from unittest import TestCase
+ from unittest.mock import Mock
+ 
+-from icloudpd.base import lp_filename_concatinator as mock_lp_filename_generator
++from icloudpd.base import lp_filename_concatenator as mock_lp_filename_generator
+ from pyicloud_ipd.asset_version import AssetVersion
+ from pyicloud_ipd.utils import disambiguate_filenames
+ from pyicloud_ipd.version_size import AssetVersionSize, LivePhotoVersionSize, VersionSize
+diff --git a/tests/test_session_connection_errors.py b/tests/test_session_connection_errors.py
+index 3c43893..73ce6f1 100644
+--- a/tests/test_session_connection_errors.py
++++ b/tests/test_session_connection_errors.py
+@@ -117,7 +117,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
+         with self.assertRaises(PyiCloudConnectionErrorException) as context:
+             self.session.get(self.base_url)
+ 
+-        self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
++        self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
+         self.assertIsInstance(context.exception.__cause__, ConnectionError)
+ 
+     def test_timeout_error_handling(self) -> None:
+@@ -128,7 +128,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
+             # Use a short timeout to ensure it times out
+             self.session.get(self.base_url, timeout=0.5)
+ 
+-        self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
++        self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
+         # The underlying exception should be a timeout-related error
+         self.assertTrue(
+             isinstance(context.exception.__cause__, TimeoutError | Timeout)
+@@ -144,7 +144,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
+             with self.assertRaises(PyiCloudConnectionErrorException) as context:
+                 self.session.get(self.base_url)
+ 
+-            self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
++            self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
+             self.assertIsInstance(context.exception.__cause__, TimeoutError)
+ 
+     def test_new_connection_error_handling(self) -> None:
+@@ -158,7 +158,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
+             with self.assertRaises(PyiCloudConnectionErrorException) as context:
+                 self.session.get(self.base_url)
+ 
+-            self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
++            self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
+             self.assertIsInstance(context.exception.__cause__, NewConnectionError)
+ 
+     def test_other_exceptions_pass_through(self) -> None:
+@@ -190,7 +190,7 @@ class TestPyiCloudSessionConnectionErrors(unittest.TestCase):
+             ):
+                 getattr(self.session, method)(self.base_url)
+ 
+-                self.assertEqual(str(context.exception), "Cannot connect to Apple iCloud service")
++                self.assertIn("Cannot connect to Apple iCloud service", str(context.exception))
+                 self.assertIsInstance(context.exception.__cause__, ConnectionError)
+ 
+ 
